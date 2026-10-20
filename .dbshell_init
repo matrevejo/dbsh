@@ -1,0 +1,18 @@
+# ==============================================================================
+# Archivo de configuración inicial para DBSH (.dbshell_init)
+# ==============================================================================
+
+# Identificador o alias del servidor
+SERVER=localhost
+
+# Parámetros de conectividad a la Base de Datos PostgreSQL
+# Si DB_HOST se deja vacío, conecta por socket UNIX local (sin contraseña para tu usuario)
+# Si se usa TCP (127.0.0.1), usa DB_USER=dbsh_user y DB_PASSWORD=dbsh_pass
+DB_HOST=
+DB_PORT=5432
+DB_NAME=dbsh_sandbox
+DB_USER=colpasus
+DB_PASSWORD=
+
+# Conexión automática al iniciar la shell (1 = activado, 0 = desactivado)
+AUTO_CONNECT=1
