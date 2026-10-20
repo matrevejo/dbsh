@@ -16,3 +16,9 @@ DB_PASSWORD=
 
 # Conexión automática al iniciar la shell (1 = activado, 0 = desactivado)
 AUTO_CONNECT=1
+
+# ==============================================================================
+# Alias de usuario persistentes (puedes añadir los tuyos aquí)
+# ==============================================================================
+alias srv="s * f servers"
+alias prods="s * f servers w status='online'"

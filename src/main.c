@@ -8,15 +8,16 @@
 
   @date         2026-10-20
 
-  @version      1.2.0
+  @version      1.3.0
 
   @brief        DBSH (Database Shell)
 
   @description  DBSH es una shell Unix interactiva y extensible escrita en C que
                 integra soporte nativo para bases de datos PostgreSQL (mediante libpq),
-                soporte completo para redirección de entrada/salida (>, >>, <),
-                tuberías Unix (|), navegación interactiva de historial con flechas
-                (arriba/abajo), edición de línea y ejecución de comandos del sistema.
+                motor inteligente de abreviaciones SQL (s * f tabla w x>1),
+                calificación automática de tablas, sistema de alias de usuario,
+                soporte completo para redirección (>, >>, <), tuberías Unix (|),
+                y navegación de historial con flechas.
 
   @help         COMANDOS INTERNOS (BUILT-IN):
                 - cd <dir>           : Cambia el directorio de trabajo actual.
@@ -29,18 +30,27 @@
                 - status             : Muestra el estado detallado de la conexión a la BBDD.
                 - sql <consulta>     : Ejecuta una consulta SQL explícitamente.
                 - history            : Muestra la lista de comandos ejecutados en la sesión.
+                - alias [k=v]        : Lista o define alias personalizados (ej: alias srv="s * f servers").
+                - unalias <nombre>   : Elimina un alias personalizado.
+
+                ABREVIACIONES SQL RÁPIDAS (PRODUCTIVIDAD):
+                - s * f <tabla> [w <cond>] [ob <col>] [l <n>]
+                  Ejemplo: s * f mitabla w x>1
+                  Se expande automáticamente a: SELECT * FROM mitabla WHERE mitabla.x>1;
+                - tables             : Muestra todas las tablas públicas.
+                - desc <tabla>       : Muestra la estructura y tipos de una tabla.
+                - c <tabla>          : Muestra el número total de filas de una tabla.
 
                 CONSULTAS SQL DIRECTAS:
-                - Escribe directamente cualquier sentencia SQL en el prompt (ej: SELECT,
-                  INSERT, UPDATE, DELETE, CREATE, DROP, etc.). Se ejecuta en la base de datos
-                  y el resultado se imprime en una tabla formateada.
+                - Escribe directamente cualquier sentencia SQL estándar en el prompt
+                  (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, etc.).
 
                 REDIRECCIÓN Y TUBERÍAS:
                 - comando > archivo  : Redirige la salida sobrescribiendo el archivo.
                 - comando >> archivo : Redirige la salida adjuntando al final del archivo.
                 - comando < archivo  : Redirige la entrada estándar desde un archivo.
                 - cmd1 | cmd2 | ...  : Conecta la salida de un comando con la entrada del siguiente.
-                * Compatible tanto con comandos de sistema como con consultas SQL y built-ins.
+                * Compatible con abreviaciones SQL, consultas directas y comandos de sistema.
 
                 EDICIÓN DE LÍNEA E HISTORIAL:
                 - Flechas Arriba/Abajo : Navega por el historial de comandos ejecutados.
@@ -49,6 +59,13 @@
                 - Persistencia         : El historial se guarda automáticamente en ~/.dbsh_history.
 
   @changelog
+    - v1.3.0 (2026-10-20) [colpasus]:
+      * Motor de abreviaciones SQL inteligentes (ej: 's * f mitabla w x>1' -> 'SELECT * FROM mitabla WHERE mitabla.x>1;').
+      * Calificación automática de columnas con el nombre de la tabla en cláusulas WHERE.
+      * Atajos rápidos para inspección de BBDD: 'tables' (listar tablas), 'desc <tabla>' (estructura) y 'c <tabla>' (conteo).
+      * Soporte para alias de usuario personalizados mediante built-ins 'alias' / 'unalias' y carga en .dbshell_init.
+      * Desambiguación inteligente entre operadores de comparación SQL ('>', '<', '>=', '<=') y redirección shell.
+      * Notificación visual '[dbsh:sql]' mostrando la consulta SQL expandida antes de su ejecución.
     - v1.2.0 (2026-10-20) [colpasus]:
       * Implementado historial interactivo navegable con flechas arriba (Up) y abajo (Down).
       * Desplazamiento de cursor con flechas izquierda/derecha, teclas Inicio/Fin y Delete.
@@ -124,6 +141,8 @@ int dbsh_disconnect(char **args);
 int dbsh_status(char **args);
 int dbsh_sql(char **args);
 int dbsh_history(char **args);
+int dbsh_alias(char **args);
+int dbsh_unalias(char **args);
 
 char *dbsh_read_line(const char *prompt);
 char **dbsh_split_line(char *line);
@@ -131,6 +150,22 @@ int dbsh_launch(char **args);
 int dbsh_execute_single(char *cmd_str);
 int dbsh_execute_pipeline(char *line);
 void dbsh_loop(void);
+
+/*
+  Alias Management System
+ */
+#define DBSH_ALIAS_MAX 64
+typedef struct {
+  char name[32];
+  char command[512];
+} dbsh_alias_t;
+
+static dbsh_alias_t dbsh_aliases[DBSH_ALIAS_MAX];
+static int dbsh_alias_count = 0;
+
+const char *dbsh_find_alias(const char *name);
+int dbsh_set_alias(const char *name, const char *val);
+char *dbsh_expand_shorthand(const char *input);
 
 /*
   History Management System
@@ -156,7 +191,9 @@ char *builtin_str[] = {
   "disconnect",
   "status",
   "sql",
-  "history"
+  "history",
+  "alias",
+  "unalias"
 };
 
 int (*builtin_func[]) (char **) = {
@@ -169,7 +206,9 @@ int (*builtin_func[]) (char **) = {
   &dbsh_disconnect,
   &dbsh_status,
   &dbsh_sql,
-  &dbsh_history
+  &dbsh_history,
+  &dbsh_alias,
+  &dbsh_unalias
 };
 
 int dbsh_num_builtins() {
@@ -191,6 +230,37 @@ void dbsh_print_prompt(void)
 {
   printf("dbsh> ");
   fflush(stdout);
+}
+
+int dbsh_set_alias(const char *name, const char *val)
+{
+  char clean_val[512] = "";
+  strncpy(clean_val, val, sizeof(clean_val) - 1);
+  clean_val[sizeof(clean_val) - 1] = '\0';
+  char *v = trim_whitespace(clean_val);
+  size_t len = strlen(v);
+  if (len >= 2 && ((v[0] == '"' && v[len - 1] == '"') || (v[0] == '\'' && v[len - 1] == '\''))) {
+    v[len - 1] = '\0';
+    v++;
+  }
+
+  for (int i = 0; i < dbsh_alias_count; i++) {
+    if (strcmp(dbsh_aliases[i].name, name) == 0) {
+      strncpy(dbsh_aliases[i].command, v, sizeof(dbsh_aliases[i].command) - 1);
+      dbsh_aliases[i].command[sizeof(dbsh_aliases[i].command) - 1] = '\0';
+      return 1;
+    }
+  }
+
+  if (dbsh_alias_count < DBSH_ALIAS_MAX) {
+    strncpy(dbsh_aliases[dbsh_alias_count].name, name, sizeof(dbsh_aliases[dbsh_alias_count].name) - 1);
+    dbsh_aliases[dbsh_alias_count].name[sizeof(dbsh_aliases[dbsh_alias_count].name) - 1] = '\0';
+    strncpy(dbsh_aliases[dbsh_alias_count].command, v, sizeof(dbsh_aliases[dbsh_alias_count].command) - 1);
+    dbsh_aliases[dbsh_alias_count].command[sizeof(dbsh_aliases[dbsh_alias_count].command) - 1] = '\0';
+    dbsh_alias_count++;
+    return 1;
+  }
+  return 0;
 }
 
 void dbsh_load_config(void)
@@ -230,6 +300,20 @@ void dbsh_load_config(void)
   while (fgets(line, sizeof(line), fp)) {
     char *trimmed = trim_whitespace(line);
     if (*trimmed == '#' || *trimmed == '\0') {
+      continue;
+    }
+
+    if (strncmp(trimmed, "alias ", 6) == 0) {
+      char *a = trim_whitespace(trimmed + 6);
+      char *eq = strchr(a, '=');
+      if (eq != NULL) {
+        *eq = '\0';
+        char *aname = trim_whitespace(a);
+        char *aval = trim_whitespace(eq + 1);
+        if (strlen(aname) > 0 && strlen(aval) > 0) {
+          dbsh_set_alias(aname, aval);
+        }
+      }
       continue;
     }
 
@@ -300,20 +384,28 @@ int dbsh_help(char **args)
 {
   (void)args;
   int i;
-  printf("DBSH (Database Shell) - v1.2.0\n");
-  printf("Escribe comandos de shell, sentencias SQL o tuberías y presiona Enter.\n\n");
+  printf("DBSH (Database Shell) - v1.3.0\n");
+  printf("Escribe comandos de shell, sentencias SQL, abreviaciones o tuberías y presiona Enter.\n\n");
   printf("Comandos built-in:\n");
   for (i = 0; i < dbsh_num_builtins(); i++) {
     printf("  %s\n", builtin_str[i]);
   }
+  printf("\nAbreviaciones SQL Rápidas (Productividad):\n");
+  printf("  s * f <tabla> [w <cond>] [ob <col>] [l <n>]\n");
+  printf("    Ejemplo: s * f mitabla w x>1\n");
+  printf("    -> SELECT * FROM mitabla WHERE mitabla.x>1;\n");
+  printf("  tables              : Lista las tablas públicas\n");
+  printf("  desc <tabla>        : Describe columnas y tipos de datos\n");
+  printf("  c <tabla>           : Muestra el total de filas de la tabla\n");
   printf("\nConsultas SQL directas:\n");
   printf("  SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, etc.\n");
   printf("\nRedirección y Tuberías:\n");
   printf("  > archivo   (sobrescribir salida)     >> archivo  (adjuntar salida)\n");
   printf("  < archivo   (redireccionar entrada)    |          (tubería entre comandos)\n");
-  printf("\nNavegación de Historial:\n");
+  printf("\nHistorial y Alias:\n");
   printf("  Flechas Arriba / Abajo : Recuperar comandos anteriores del historial\n");
-  printf("  Comando 'history'      : Ver lista completa de comandos ejecutados\n\n");
+  printf("  alias nombre=\"comando\"  : Define un alias personalizado\n");
+  printf("  unalias nombre         : Elimina un alias\n\n");
   return 1;
 }
 
@@ -641,6 +733,294 @@ void dbsh_save_history(void)
   fclose(fp);
 }
 
+const char *dbsh_find_alias(const char *name)
+{
+  for (int i = 0; i < dbsh_alias_count; i++) {
+    if (strcmp(dbsh_aliases[i].name, name) == 0) {
+      return dbsh_aliases[i].command;
+    }
+  }
+  return NULL;
+}
+
+int dbsh_alias(char **args)
+{
+  if (args[1] == NULL) {
+    printf("\n=== Alias de Usuario en DBSH ===\n");
+    if (dbsh_alias_count == 0) {
+      printf("  (No hay alias definidos. Uso: alias nombre=\"comando\")\n");
+    } else {
+      for (int i = 0; i < dbsh_alias_count; i++) {
+        printf("  alias %s='%s'\n", dbsh_aliases[i].name, dbsh_aliases[i].command);
+      }
+    }
+    printf("================================\n\n");
+    return 1;
+  }
+
+  char *eq = strchr(args[1], '=');
+  if (eq == NULL) {
+    const char *val = dbsh_find_alias(args[1]);
+    if (val) {
+      printf("alias %s='%s'\n", args[1], val);
+    } else {
+      fprintf(stderr, "dbsh: alias '%s' no encontrado\n", args[1]);
+    }
+    return 1;
+  }
+
+  *eq = '\0';
+  char *name = args[1];
+  char *val = eq + 1;
+
+  char full_val[512] = "";
+  if (val[0] == '\'' || val[0] == '"') {
+    val++;
+    strncat(full_val, val, sizeof(full_val) - 1);
+    for (int i = 2; args[i] != NULL; i++) {
+      strncat(full_val, " ", sizeof(full_val) - strlen(full_val) - 1);
+      strncat(full_val, args[i], sizeof(full_val) - strlen(full_val) - 1);
+    }
+    size_t l = strlen(full_val);
+    if (l > 0 && (full_val[l - 1] == '\'' || full_val[l - 1] == '"')) {
+      full_val[l - 1] = '\0';
+    }
+  } else {
+    strncat(full_val, val, sizeof(full_val) - 1);
+    for (int i = 2; args[i] != NULL; i++) {
+      strncat(full_val, " ", sizeof(full_val) - strlen(full_val) - 1);
+      strncat(full_val, args[i], sizeof(full_val) - strlen(full_val) - 1);
+    }
+  }
+
+  if (dbsh_set_alias(name, full_val)) {
+    printf("[dbsh] Alias registrado: %s -> '%s'\n", name, full_val);
+  } else {
+    fprintf(stderr, "dbsh: límite de alias alcanzado (%d)\n", DBSH_ALIAS_MAX);
+  }
+
+  return 1;
+}
+
+int dbsh_unalias(char **args)
+{
+  if (args[1] == NULL) {
+    fprintf(stderr, "dbsh: uso: unalias <nombre_alias>\n");
+    return 1;
+  }
+
+  for (int i = 0; i < dbsh_alias_count; i++) {
+    if (strcmp(dbsh_aliases[i].name, args[1]) == 0) {
+      for (int j = i; j < dbsh_alias_count - 1; j++) {
+        dbsh_aliases[j] = dbsh_aliases[j + 1];
+      }
+      dbsh_alias_count--;
+      printf("[dbsh] Alias '%s' eliminado.\n", args[1]);
+      return 1;
+    }
+  }
+
+  fprintf(stderr, "dbsh: alias '%s' no encontrado\n", args[1]);
+  return 1;
+}
+
+static int is_sql_operator(const char *t)
+{
+  if (!t) return 0;
+  return (strcmp(t, "=") == 0 || strcmp(t, ">") == 0 || strcmp(t, "<") == 0 ||
+          strcmp(t, ">=") == 0 || strcmp(t, "<=") == 0 || strcmp(t, "!=") == 0 ||
+          strcmp(t, "<>") == 0 || strcasecmp(t, "like") == 0 || strcasecmp(t, "ilike") == 0 ||
+          strcasecmp(t, "is") == 0 || strcasecmp(t, "in") == 0 || strcasecmp(t, "between") == 0 ||
+          strcmp(t, "~") == 0 || strcmp(t, "!~") == 0);
+}
+
+static void qualify_table_col(const char *t, const char *next_t, const char *table, char *out, size_t out_sz)
+{
+  if (!table || strlen(table) == 0) {
+    snprintf(out, out_sz, "%s", t);
+    return;
+  }
+
+  // No cualificar palabras clave lógicas o literales comunes de SQL
+  if (strcasecmp(t, "and") == 0 || strcasecmp(t, "or") == 0 || strcasecmp(t, "not") == 0 ||
+      strcasecmp(t, "is") == 0 || strcasecmp(t, "in") == 0 || strcasecmp(t, "null") == 0 ||
+      strcasecmp(t, "between") == 0 || strcasecmp(t, "like") == 0 || strcasecmp(t, "ilike") == 0 ||
+      strcasecmp(t, "true") == 0 || strcasecmp(t, "false") == 0) {
+    snprintf(out, out_sz, "%s", t);
+    return;
+  }
+
+  // Si t contiene el operador directamente, ej: x>1 o status='online'
+  char *ops = "><=!~";
+  const char *op_pos = strpbrk(t, ops);
+  if (op_pos != NULL) {
+    int id_len = op_pos - t;
+    char id[64];
+    if (id_len > 0 && id_len < 63) {
+      strncpy(id, t, id_len);
+      id[id_len] = '\0';
+      if (strchr(id, '.') == NULL && strlen(id) > 0 && isalpha((unsigned char)id[0])) {
+        snprintf(out, out_sz, "%s.%s%s", table, id, op_pos);
+        return;
+      }
+    }
+  }
+
+  // Si el operador está en el siguiente token, ej: "x" seguido de ">"
+  if (next_t != NULL && is_sql_operator(next_t)) {
+    if (strchr(t, '.') == NULL && strlen(t) > 0 && isalpha((unsigned char)t[0])) {
+      snprintf(out, out_sz, "%s.%s", table, t);
+      return;
+    }
+  }
+
+  snprintf(out, out_sz, "%s", t);
+}
+
+char *dbsh_expand_shorthand(const char *input)
+{
+  char line[2048];
+  strncpy(line, input, sizeof(line) - 1);
+  line[sizeof(line) - 1] = '\0';
+
+  char *p = line;
+  while (isspace((unsigned char)*p)) p++;
+  if (*p == '\0') return NULL;
+
+  char first[32] = "";
+  sscanf(p, "%31s", first);
+
+  // Atajos directos de inspección
+  if (strcasecmp(first, "tables") == 0 || strcasecmp(first, "\\dt") == 0) {
+    return strdup("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name;");
+  }
+  if (strcasecmp(first, "desc") == 0 || (strcasecmp(first, "d") == 0 && strlen(p) > 2)) {
+    char tbl[64] = "";
+    sscanf(p + strlen(first), "%63s", tbl);
+    if (strlen(tbl) > 0) {
+      char sql[512];
+      snprintf(sql, sizeof(sql),
+               "SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_name = '%s' ORDER BY ordinal_position;",
+               tbl);
+      return strdup(sql);
+    }
+  }
+  if (strcasecmp(first, "c") == 0 || strcasecmp(first, "count") == 0) {
+    char tbl[64] = "";
+    sscanf(p + strlen(first), "%63s", tbl);
+    if (strlen(tbl) > 0) {
+      char sql[256];
+      snprintf(sql, sizeof(sql), "SELECT count(*) AS total_rows FROM %s;", tbl);
+      return strdup(sql);
+    }
+  }
+
+  // Triggers de abreviaciones SQL (s, i, u, del)
+  if (strcasecmp(first, "s") != 0 && strcasecmp(first, "i") != 0 &&
+      strcasecmp(first, "u") != 0 && strcasecmp(first, "del") != 0) {
+    return NULL;
+  }
+
+  // Tokenización respetando comillas
+  char *tokens[128];
+  int token_count = 0;
+  int len = strlen(p);
+  char quote = 0;
+  int start = -1;
+
+  for (int i = 0; i <= len; i++) {
+    char c = p[i];
+    if (!quote && (c == '\'' || c == '"')) {
+      quote = c;
+      if (start == -1) start = i;
+    } else if (quote && c == quote) {
+      quote = 0;
+    } else if (!quote && (isspace((unsigned char)c) || c == '\0')) {
+      if (start != -1) {
+        p[i] = '\0';
+        tokens[token_count++] = p + start;
+        start = -1;
+        if (token_count >= 127) break;
+      }
+    } else {
+      if (start == -1) start = i;
+    }
+  }
+
+  if (token_count == 0) return NULL;
+
+  // Paso 1: Localizar la tabla principal tras 'f'
+  char main_table[64] = "";
+  for (int i = 0; i < token_count; i++) {
+    if (strcasecmp(tokens[i], "f") == 0 && i + 1 < token_count) {
+      strncpy(main_table, tokens[i + 1], sizeof(main_table) - 1);
+      main_table[sizeof(main_table) - 1] = '\0';
+      break;
+    }
+  }
+
+  // Paso 2: Construir la consulta SQL expandida
+  char buf[4096] = "";
+  int in_where = 0;
+
+  for (int i = 0; i < token_count; i++) {
+    const char *t = tokens[i];
+    if (i > 0) strcat(buf, " ");
+
+    if (i == 0 && strcasecmp(t, "s") == 0) {
+      strcat(buf, "SELECT");
+    } else if (i == 0 && strcasecmp(t, "i") == 0) {
+      strcat(buf, "INSERT INTO");
+    } else if (i == 0 && strcasecmp(t, "u") == 0) {
+      strcat(buf, "UPDATE");
+    } else if (i == 0 && strcasecmp(t, "del") == 0) {
+      strcat(buf, "DELETE FROM");
+    } else if (strcasecmp(t, "f") == 0) {
+      strcat(buf, "FROM");
+      in_where = 0;
+    } else if (strcasecmp(t, "w") == 0) {
+      strcat(buf, "WHERE");
+      in_where = 1;
+    } else if (strcasecmp(t, "ob") == 0 || strcasecmp(t, "o") == 0) {
+      strcat(buf, "ORDER BY");
+      in_where = 0;
+    } else if (strcasecmp(t, "gb") == 0 || strcasecmp(t, "g") == 0) {
+      strcat(buf, "GROUP BY");
+      in_where = 0;
+    } else if (strcasecmp(t, "l") == 0 || strcasecmp(t, "lim") == 0) {
+      strcat(buf, "LIMIT");
+      in_where = 0;
+    } else if (strcasecmp(t, "j") == 0) {
+      strcat(buf, "JOIN");
+      in_where = 0;
+    } else if (strcasecmp(t, "lj") == 0) {
+      strcat(buf, "LEFT JOIN");
+      in_where = 0;
+    } else if (strcasecmp(t, "ij") == 0) {
+      strcat(buf, "INNER JOIN");
+      in_where = 0;
+    } else if (strcasecmp(t, "v") == 0) {
+      strcat(buf, "VALUES");
+      in_where = 0;
+    } else {
+      if (in_where) {
+        const char *next_t = (i + 1 < token_count) ? tokens[i + 1] : NULL;
+        char qual[256];
+        qualify_table_col(t, next_t, main_table, qual, sizeof(qual));
+        strcat(buf, qual);
+      } else {
+        strcat(buf, t);
+      }
+    }
+  }
+
+  if (strlen(buf) > 0 && buf[strlen(buf) - 1] != ';') {
+    strcat(buf, ";");
+  }
+
+  return strdup(buf);
+}
+
 /**
   @brief Launch a program and wait for it to terminate.
   @param args Null terminated list of arguments (including program).
@@ -682,6 +1062,31 @@ static void trim_inplace(char *s)
   }
 }
 
+static int is_sql_comparison_operator(const char *cmd, int i)
+{
+  if (i > 0 && (cmd[i - 1] == '<' || cmd[i - 1] == '=' || cmd[i - 1] == '!' || cmd[i - 1] == '~')) return 1;
+  if (cmd[i + 1] == '=' || (cmd[i] == '<' && cmd[i + 1] == '>')) return 1;
+
+  int prev = i - 1;
+  while (prev >= 0 && isspace((unsigned char)cmd[prev])) prev--;
+
+  int next = i + 1;
+  while (cmd[next] && isspace((unsigned char)cmd[next])) next++;
+
+  if (prev >= 0 && next < (int)strlen(cmd)) {
+    if (isalnum((unsigned char)cmd[prev]) || cmd[prev] == '_' || cmd[prev] == ')') {
+      if (isdigit((unsigned char)cmd[next]) || cmd[next] == '\'' || cmd[next] == '"') {
+        return 1;
+      }
+      if (i > 0 && !isspace((unsigned char)cmd[i - 1]) && !isspace((unsigned char)cmd[i + 1])) {
+        return 1;
+      }
+    }
+  }
+
+  return 0;
+}
+
 /**
    @brief Parse redirection operators (<, >, >>) outside of quotes.
    @param cmd Command string to parse and modify in-place.
@@ -704,6 +1109,12 @@ int parse_redirection(char *cmd, char **infile, char **outfile, int *append)
     } else if (quote && cmd[i] == quote) {
       quote = 0;
     } else if (!quote) {
+      if (cmd[i] == '>' || cmd[i] == '<') {
+        if (is_sql_comparison_operator(cmd, i)) {
+          continue;
+        }
+      }
+
       if (cmd[i] == '>' && cmd[i + 1] == '>') {
         cmd[i] = '\0';
         cmd[i + 1] = '\0';
@@ -825,28 +1236,57 @@ int dbsh_execute_single(char *cmd_str)
     close(fd_out);
   }
 
-  char *raw_cmd = strdup(cmd_str);
-  char **args = dbsh_split_line(cmd_str);
+  // 1. Expandir alias definidos por el usuario
+  char cmd_expanded[2048];
+  char first_word[64] = "";
+  sscanf(cmd_str, "%63s", first_word);
+  const char *aliased = dbsh_find_alias(first_word);
+  if (aliased != NULL) {
+    char *rest = cmd_str + strlen(first_word);
+    while (isspace((unsigned char)*rest)) rest++;
+    if (strlen(rest) > 0) {
+      snprintf(cmd_expanded, sizeof(cmd_expanded), "%s %s", aliased, rest);
+    } else {
+      snprintf(cmd_expanded, sizeof(cmd_expanded), "%s", aliased);
+    }
+  } else {
+    strncpy(cmd_expanded, cmd_str, sizeof(cmd_expanded) - 1);
+    cmd_expanded[sizeof(cmd_expanded) - 1] = '\0';
+  }
+
+  // 2. Expandir abreviaciones SQL inteligentes (ej: s * f mitabla w x>1)
+  char *expanded_sql = dbsh_expand_shorthand(cmd_expanded);
   int status = 1;
 
-  if (args[0] != NULL) {
-    if (is_sql_command(args[0])) {
-      const char *p = raw_cmd;
-      while (isspace((unsigned char)*p)) p++;
-      status = dbsh_execute_sql(p);
-    } else {
-      int is_builtin = 0;
-      for (int i = 0; i < dbsh_num_builtins(); i++) {
-        if (strcmp(args[0], builtin_str[i]) == 0) {
-          status = (*builtin_func[i])(args);
-          is_builtin = 1;
-          break;
+  if (expanded_sql != NULL) {
+    printf("[dbsh:sql] %s\n", expanded_sql);
+    status = dbsh_execute_sql(expanded_sql);
+    free(expanded_sql);
+  } else {
+    char *raw_cmd = strdup(cmd_expanded);
+    char **args = dbsh_split_line(cmd_expanded);
+
+    if (args[0] != NULL) {
+      if (is_sql_command(args[0])) {
+        const char *p = raw_cmd;
+        while (isspace((unsigned char)*p)) p++;
+        status = dbsh_execute_sql(p);
+      } else {
+        int is_builtin = 0;
+        for (int i = 0; i < dbsh_num_builtins(); i++) {
+          if (strcmp(args[0], builtin_str[i]) == 0) {
+            status = (*builtin_func[i])(args);
+            is_builtin = 1;
+            break;
+          }
+        }
+        if (!is_builtin) {
+          status = dbsh_launch(args);
         }
       }
-      if (!is_builtin) {
-        status = dbsh_launch(args);
-      }
     }
+    free(raw_cmd);
+    free(args);
   }
 
   fflush(stdout);
@@ -859,9 +1299,6 @@ int dbsh_execute_single(char *cmd_str)
     dup2(saved_stdout, STDOUT_FILENO);
     close(saved_stdout);
   }
-
-  free(raw_cmd);
-  free(args);
 
   return status;
 }
